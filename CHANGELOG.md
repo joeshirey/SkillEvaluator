@@ -31,6 +31,14 @@ All notable changes to SkillEvaluator are documented in this file.
 - SARIF 2.1.0 reporter (`-r sarif`) for GitHub Code Scanning and other SARIF
   consumers. Findings map to rule IDs, severity levels, and file locations from
   Tier 1 validation results.
+- _(downstream, this fork only)_ `SKILL_EVAL_LLM_FALLBACK_PROJECTS` sets a
+  comma-separated list of fallback GCP project IDs. When a judge call to a
+  Vertex AI OpenAPI endpoint under ADC credentials hits a 429 rate limit or a
+  request timeout, `LLMClient.completions()` retries the same request against
+  each fallback project in order (same OAuth identity, only the project
+  segment of the URL changes) before giving up and raising the original
+  error. Unset or empty, behavior is unchanged. The fallback is per-call only
+  and is not persisted to subsequent, unrelated calls.
 
 ### Fixed
 

@@ -31,7 +31,9 @@ from skillevaluator.provider_config import (
     OPENAI_BASE_URL,
     ProviderConfig,
     ProviderConfigurationError,
+    _is_vertex_openapi_endpoint,
     _model_leaf,
+    _parse_vertex_openapi_metadata,
     _supports_custom_temperature,
     resolve_llm_provider,
 )
@@ -102,6 +104,21 @@ def _temperature_kwargs(model: str, temperature: float | None) -> dict[str, floa
     if temperature is None or not _supports_custom_temperature(model):
         return {}
     return {"temperature": temperature}
+
+
+def _is_vertex_rate_limit_or_timeout(exc: Exception) -> bool:
+    """Return whether ``exc`` is a 429 rate limit or a request timeout.
+
+    Matches ``openai.RateLimitError``/``openai.APITimeoutError`` directly, and
+    also treats any exception carrying ``status_code == 429`` or a bare
+    ``TimeoutError`` as equivalent, in case the SDK's own exception hierarchy
+    changes or a different error type surfaces the same condition.
+    """
+    from openai import APITimeoutError, RateLimitError
+
+    if isinstance(exc, (RateLimitError, APITimeoutError, TimeoutError)):
+        return True
+    return getattr(exc, "status_code", None) == 429
 
 
 class LLMClient:
@@ -307,6 +324,8 @@ class LLMClient:
                         response = client.chat.completions.create(**call_kwargs)
                     else:
                         raise
+                elif _is_vertex_rate_limit_or_timeout(exc) and _is_vertex_openapi_endpoint(config.base_url):
+                    response = self._retry_with_fallback_projects(client, config, call_kwargs, exc)
                 else:
                     raise
             else:
@@ -315,6 +334,49 @@ class LLMClient:
         if not content:
             raise EmptyLLMResponseError("LLM returned empty response content")
         return content.strip()
+
+    def _retry_with_fallback_projects(
+        self,
+        client: Any,
+        config: ProviderConfig,
+        call_kwargs: dict[str, Any],
+        original_exc: Exception,
+    ) -> Any:
+        """Retry a rate-limited/timed-out Vertex OpenAPI call against fallback projects.
+
+        Same identity, same OAuth token -- Vertex AI access tokens are
+        project-agnostic, so only the project segment of the URL changes.
+        This is deliberately per-call only: unlike the 401 token-refresh
+        path, no change is persisted to ``self`` or ``self._provider_config``,
+        so the next unrelated call still tries the primary project first.
+        Raises the ORIGINAL exception if no fallback project is configured
+        or every fallback attempt also fails.
+        """
+        fallback_projects = [
+            project.strip()
+            for project in os.environ.get("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "").split(",")
+            if project.strip()
+        ]
+        if not fallback_projects:
+            raise original_exc
+
+        primary_project, location = _parse_vertex_openapi_metadata(config.base_url)
+        if not primary_project or not location:
+            raise original_exc
+
+        for fallback_project in fallback_projects:
+            if fallback_project == primary_project:
+                continue
+            fallback_base_url = config.base_url.replace(
+                f"/projects/{primary_project}/locations/{location}/endpoints/openapi",
+                f"/projects/{fallback_project}/locations/{location}/endpoints/openapi",
+            )
+            client.base_url = fallback_base_url
+            try:
+                return client.chat.completions.create(**call_kwargs)
+            except Exception:
+                continue
+        raise original_exc
 
     def extract_json_from_response(self, system_prompt: str, user_prompt: str) -> dict:
         """Send a completion and parse JSON from the response."""
