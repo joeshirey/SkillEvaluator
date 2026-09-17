@@ -325,7 +325,7 @@ class LLMClient:
                     else:
                         raise
                 elif _is_vertex_rate_limit_or_timeout(exc) and _is_vertex_openapi_endpoint(config.base_url):
-                    response = self._retry_with_fallback_projects(client, config, call_kwargs, exc)
+                    response = self._retry_with_fallback_projects(config, call_kwargs, exc)
                 else:
                     raise
             else:
@@ -337,7 +337,6 @@ class LLMClient:
 
     def _retry_with_fallback_projects(
         self,
-        client: Any,
         config: ProviderConfig,
         call_kwargs: dict[str, Any],
         original_exc: Exception,
@@ -347,8 +346,14 @@ class LLMClient:
         Same identity, same OAuth token -- Vertex AI access tokens are
         project-agnostic, so only the project segment of the URL changes.
         This is deliberately per-call only: unlike the 401 token-refresh
-        path, no change is persisted to ``self`` or ``self._provider_config``,
-        so the next unrelated call still tries the primary project first.
+        path, nothing is persisted to ``self``, ``self._client``, or
+        ``self._provider_config``, so the next unrelated call still tries
+        the primary project first. Each fallback attempt is made against a
+        freshly constructed, throwaway ``OpenAI`` client scoped to that one
+        attempt -- the shared/cached client (``self._client``) is never
+        touched here, which both avoids leaking the fallback choice into
+        later calls and makes this method safe to call concurrently from
+        multiple threads sharing one ``LLMClient`` instance.
         Raises the ORIGINAL exception if no fallback project is configured
         or every fallback attempt also fails.
         """
@@ -364,6 +369,8 @@ class LLMClient:
         if not primary_project or not location:
             raise original_exc
 
+        from openai import OpenAI
+
         for fallback_project in fallback_projects:
             if fallback_project == primary_project:
                 continue
@@ -371,11 +378,13 @@ class LLMClient:
                 f"/projects/{primary_project}/locations/{location}/endpoints/openapi",
                 f"/projects/{fallback_project}/locations/{location}/endpoints/openapi",
             )
-            client.base_url = fallback_base_url
+            fallback_client = OpenAI(api_key=config.api_key, base_url=fallback_base_url)
             try:
-                return client.chat.completions.create(**call_kwargs)
+                return fallback_client.chat.completions.create(**call_kwargs)
             except Exception:
                 continue
+            finally:
+                fallback_client.close()
         raise original_exc
 
     def extract_json_from_response(self, system_prompt: str, user_prompt: str) -> dict:

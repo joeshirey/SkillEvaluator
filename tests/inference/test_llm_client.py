@@ -730,7 +730,15 @@ class TestCompletions:
         assert client._resolved_config().api_key == "explicit-user-key"
 
     def test_vertex_openapi_retries_next_project_on_rate_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Retry against a fallback GCP project when the primary project is rate-limited (429)."""
+        """Retry against a fallback GCP project when the primary project is rate-limited (429).
+
+        The retry is made against a freshly constructed, scoped client
+        (mirroring production, where each fallback attempt gets its own
+        throwaway ``OpenAI`` instance) rather than mutating the cached
+        primary client in place -- see
+        ``test_vertex_openapi_fallback_does_not_leak_across_calls`` for the
+        regression test that pins down why.
+        """
         from openai import RateLimitError
 
         vertex_base_url = (
@@ -742,21 +750,29 @@ class TestCompletions:
         monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1,fallback-proj-2")
         monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
 
-        mock_openai = MagicMock()
-        mock_openai.base_url = vertex_base_url
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
         mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
         mock_success_response = MagicMock()
         mock_success_response.choices = [MagicMock(message=MagicMock(content="Fallback response"))]
-        mock_openai.chat.completions.create.side_effect = [mock_rate_limit_err, mock_success_response]
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client.chat.completions.create.side_effect = [mock_success_response]
 
-        with patch("openai.OpenAI", return_value=mock_openai):
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
             client = LLMClient()
             result = client.completions("system", "user")
 
         assert result == "Fallback response"
-        assert mock_openai.chat.completions.create.call_count == 2
-        assert "fallback-proj-1" in str(mock_openai.base_url)
-        assert "primary-proj" not in str(mock_openai.base_url)
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_count == 1
+        assert mock_ctor.call_count == 2
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert "primary-proj" not in mock_ctor.call_args_list[1].kwargs["base_url"]
+        # The cached primary client is left completely untouched.
+        assert primary_client.base_url == vertex_base_url
 
     def test_vertex_openapi_falls_back_through_multiple_projects_on_timeout(
         self, monkeypatch: pytest.MonkeyPatch
@@ -773,25 +789,103 @@ class TestCompletions:
         monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1,fallback-proj-2")
         monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
 
-        mock_openai = MagicMock()
-        mock_openai.base_url = vertex_base_url
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client_1 = MagicMock()
+        fallback_client_1.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+        fallback_client_2 = MagicMock()
+        fallback_client_2.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-2")
+
         mock_timeout_err = APITimeoutError(MagicMock())
         mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
         mock_success_response = MagicMock()
         mock_success_response.choices = [MagicMock(message=MagicMock(content="Second fallback response"))]
-        mock_openai.chat.completions.create.side_effect = [
-            mock_timeout_err,
-            mock_rate_limit_err,
-            mock_success_response,
-        ]
+        primary_client.chat.completions.create.side_effect = [mock_timeout_err]
+        fallback_client_1.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client_2.chat.completions.create.side_effect = [mock_success_response]
 
-        with patch("openai.OpenAI", return_value=mock_openai):
+        with patch(
+            "openai.OpenAI", side_effect=[primary_client, fallback_client_1, fallback_client_2]
+        ) as mock_ctor:
             client = LLMClient()
             result = client.completions("system", "user")
 
         assert result == "Second fallback response"
-        assert mock_openai.chat.completions.create.call_count == 3
-        assert "fallback-proj-2" in str(mock_openai.base_url)
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client_1.chat.completions.create.call_count == 1
+        assert fallback_client_2.chat.completions.create.call_count == 1
+        assert mock_ctor.call_count == 3
+        assert "fallback-proj-2" in mock_ctor.call_args_list[2].kwargs["base_url"]
+        assert primary_client.base_url == vertex_base_url
+
+    def test_vertex_openapi_fallback_does_not_leak_across_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fallback project used for one call must not persist to a later, unrelated call.
+
+        Regression test for a bug where ``_retry_with_fallback_projects``
+        mutated the shared, cached ``LLMClient._client`` object's
+        ``base_url`` in place and never restored it, so a fallback chosen
+        for one call silently "stuck" and redirected the NEXT, unrelated
+        call made through the same ``LLMClient`` instance -- and, under
+        concurrent use of one client from multiple threads, could redirect
+        another thread's in-flight primary-project call mid-request.
+        """
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        # The client constructed first (and cached as LLMClient._client for
+        # the lifetime of the instance) -- this object must NEVER have its
+        # base_url mutated, since it is reused for every subsequent call.
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        # A second, distinct client object returned for the fallback retry.
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        fallback_success_response = MagicMock()
+        fallback_success_response.choices = [MagicMock(message=MagicMock(content="Fallback response"))]
+        second_call_response = MagicMock()
+        second_call_response.choices = [MagicMock(message=MagicMock(content="Second call response"))]
+
+        # First completions() call: primary 429s, fallback succeeds.
+        # Second completions() call (a later, unrelated request through the
+        # SAME LLMClient instance): must go straight to the primary client
+        # and succeed there -- it must not be routed to the fallback client.
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err, second_call_response]
+        fallback_client.chat.completions.create.side_effect = [fallback_success_response]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
+            client = LLMClient()
+            first_result = client.completions("system", "user one")
+            second_result = client.completions("system", "user two")
+
+        assert first_result == "Fallback response"
+        assert second_result == "Second call response"
+
+        # The cached primary client's base_url must be untouched -- proof
+        # that the fallback attempt did not mutate shared state.
+        assert primary_client.base_url == vertex_base_url
+
+        # The second call went through the SAME cached primary client
+        # object (not a client left pointed at the fallback project), and
+        # the fallback client was used exactly once, only for the retry.
+        assert primary_client.chat.completions.create.call_count == 2
+        assert fallback_client.chat.completions.create.call_count == 1
+
+        # Only one OpenAI() client was constructed as the long-lived cached
+        # client (the primary); the fallback used its own scoped instance
+        # rather than reconstructing/replacing the cached one.
+        assert mock_ctor.call_count == 2
+        assert mock_ctor.call_args_list[0].kwargs["base_url"] == vertex_base_url
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
 
     def test_vertex_openapi_without_fallback_env_var_reraises_original_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -819,6 +913,105 @@ class TestCompletions:
                 client.completions("system", "user")
 
         assert mock_openai.chat.completions.create.call_count == 1
+
+    def test_vertex_openapi_fallback_list_skips_self_referential_primary_project(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fallback list that includes the primary project itself skips that entry.
+
+        ``SKILL_EVAL_LLM_FALLBACK_PROJECTS=primary-proj,fallback-proj-1`` must
+        behave identically to going straight to ``fallback-proj-1`` -- the
+        self-referential entry is never attempted as a redundant retry
+        against the same URL that already failed.
+        """
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "primary-proj,fallback-proj-1")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        mock_success_response = MagicMock()
+        mock_success_response.choices = [MagicMock(message=MagicMock(content="Fallback response"))]
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client.chat.completions.create.side_effect = [mock_success_response]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Fallback response"
+        # Exactly one client constructed for the retry -- the self-referential
+        # "primary-proj" entry was skipped, so only "fallback-proj-1" was
+        # attempted (2 total OpenAI() calls: the cached primary + the one
+        # real fallback attempt, not 3).
+        assert mock_ctor.call_count == 2
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert fallback_client.chat.completions.create.call_count == 1
+
+    def test_vertex_openapi_fallback_list_filters_empty_and_whitespace_entries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty-string and whitespace-only entries in the fallback list are filtered out.
+
+        ``SKILL_EVAL_LLM_FALLBACK_PROJECTS="proj1,, proj2 "`` must not attempt
+        a literal empty or whitespace project ID -- it should try ``proj1``
+        (trimmed) then ``proj2`` (trimmed), skipping the blank middle entry
+        entirely.
+        """
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "proj1,, proj2 ")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        proj1_client = MagicMock()
+        proj1_client.base_url = vertex_base_url.replace("primary-proj", "proj1")
+        proj2_client = MagicMock()
+        proj2_client.base_url = vertex_base_url.replace("primary-proj", "proj2")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        mock_proj1_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        mock_success_response = MagicMock()
+        mock_success_response.choices = [MagicMock(message=MagicMock(content="Proj2 response"))]
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        proj1_client.chat.completions.create.side_effect = [mock_proj1_err]
+        proj2_client.chat.completions.create.side_effect = [mock_success_response]
+
+        with patch(
+            "openai.OpenAI", side_effect=[primary_client, proj1_client, proj2_client]
+        ) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Proj2 response"
+        # Exactly 3 OpenAI() constructions: cached primary + proj1 attempt +
+        # proj2 attempt. If the blank entry were attempted as a literal
+        # project ID, there would be a 4th construction with an empty/blank
+        # project segment in the URL.
+        assert mock_ctor.call_count == 3
+        assert "proj1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert "proj2" in mock_ctor.call_args_list[2].kwargs["base_url"]
+        for call in mock_ctor.call_args_list:
+            assert "/projects//" not in call.kwargs["base_url"]
+            assert "/projects/ " not in call.kwargs["base_url"]
 
 
 class TestExtractJsonFromResponse:
