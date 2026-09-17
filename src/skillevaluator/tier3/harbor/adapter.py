@@ -1808,11 +1808,12 @@ def _write_task_toml(
     memory_mb = _task_resource_value(task_resources, "memory_mb", 4096)
     storage_mb = _task_resource_value(task_resources, "storage_mb", 2048)
     workdir_line = f"workdir = {_toml_quote(agent_workdir)}\n" if agent_workdir else ""
+    arm = "with-skill" if has_skill else "without-skill"
 
     content = f"""schema_version = "1.3"
 
 [task]
-name = {_toml_quote(f"nvidia/skillevaluator-{entry_id}")}
+name = {_toml_quote(f"nvidia/skillevaluator-{entry_id}-{arm}")}
 description = {_toml_quote(f"Skill evaluation task for {expected_skill}")}
 
 [metadata]

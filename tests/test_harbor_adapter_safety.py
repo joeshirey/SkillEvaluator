@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -601,3 +602,45 @@ def test_write_task_toml_writes_mcp_servers_json_and_headers(tmp_path: Path) -> 
     assert mcp_json_path.is_file()
     loaded = json.loads(mcp_json_path.read_text(encoding="utf-8"))
     assert loaded == mcp_servers
+
+
+def _task_name(task_dir: Path) -> str:
+    parsed = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
+    return str(parsed["task"]["name"])
+
+
+def test_write_task_toml_name_differs_by_arm_but_stable_across_attempts(tmp_path: Path) -> None:
+    """[task].name must differ between with-skill/without-skill arms of the same
+    scenario, so Harbor's GKE image cache cannot reuse one arm's built image for
+    the other arm. It must stay IDENTICAL across repeated attempts of the SAME
+    arm, so image-reuse caching is preserved within an arm."""
+    entry = {"id": "case-001", "expected_skill": "test-skill"}
+
+    with_attempt_1 = tmp_path / "with-attempt-1"
+    with_attempt_1.mkdir()
+    _write_task_toml(with_attempt_1, entry, has_skill=True)
+
+    with_attempt_2 = tmp_path / "with-attempt-2"
+    with_attempt_2.mkdir()
+    _write_task_toml(with_attempt_2, entry, has_skill=True)
+
+    without_attempt_1 = tmp_path / "without-attempt-1"
+    without_attempt_1.mkdir()
+    _write_task_toml(without_attempt_1, entry, has_skill=False)
+
+    without_attempt_2 = tmp_path / "without-attempt-2"
+    without_attempt_2.mkdir()
+    _write_task_toml(without_attempt_2, entry, has_skill=False)
+
+    with_name_1 = _task_name(with_attempt_1)
+    with_name_2 = _task_name(with_attempt_2)
+    without_name_1 = _task_name(without_attempt_1)
+    without_name_2 = _task_name(without_attempt_2)
+
+    # Same arm, repeated k-attempts: identical name so Harbor reuses the built image.
+    assert with_name_1 == with_name_2
+    assert without_name_1 == without_name_2
+
+    # Different arms of the SAME scenario: names must differ so Harbor cannot
+    # reuse a cached image built for one arm when building the other arm.
+    assert with_name_1 != without_name_1

@@ -581,6 +581,47 @@ def test_single_step_harbor_null_step_results_keeps_custom_reward_scoreable(tmp_
     assert agent["pass_at_k"]["with_skill"]["rate"] == 1.0
 
 
+def test_arm_suffixed_harbor_task_name_reconciles_to_bare_case_id(tmp_path: Path) -> None:
+    """Harbor's own result.json `task_name` mirrors the Harbor [task].name that
+    SkillEvaluator generates, which now carries a with-skill/without-skill arm
+    suffix (see adapter._write_task_toml, fixed to stop with/without-skill
+    Harbor image-tag collisions). When a reward carries no entry_id of its
+    own, the collector falls back to task_name to recover it -- confirm that
+    fallback still reconciles to the bare scenario id instead of leaking
+    `skillevaluator-<id>-<arm>` into the report as an unmatched extra case
+    while the real scenario is left unscored."""
+    job_dir = tmp_path / "jobs" / "demo-opencode-with"
+    trial_name = "case-001__attempt"
+    trial_dir = job_dir / trial_name
+    reward = {**dict.fromkeys(DEFAULT_METRICS, 0.75), "metric_set": DEFAULT_METRIC_SET, "overall": 0.75}
+    (trial_dir / "result.json").parent.mkdir(parents=True)
+    (trial_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": trial_name,
+                "task_name": "nvidia/skillevaluator-case-001-with-skill",
+                "verifier_result": {"rewards": reward},
+                "step_results": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_reward(job_dir, trial_name, reward)
+    _write_complete_job_result(job_dir, [trial_name])
+
+    result = _collect(tmp_path, skip_baseline=True, case_ids=["case-001"])
+
+    agent = result["agents"]["opencode"]
+    assert result["execution_status"] == "succeeded"
+    pass_at_k = agent["pass_at_k"]["with_skill"]
+    # The scenario must land under its bare id, not leak as an unmatched
+    # "extra case" while case-001 itself is reported as never attempted.
+    assert pass_at_k["extra_cases"] == []
+    assert "case-001" in pass_at_k["cases"]
+    assert pass_at_k["cases"]["case-001"]["attempts_used"] == 1
+    assert pass_at_k["rate"] == 1.0
+
+
 @pytest.mark.parametrize("invalid_steps", [{}, "malformed-steps"], ids=("mapping", "string"))
 def test_authoritative_default_aggregate_rejects_malformed_step_results_container(
     tmp_path: Path,

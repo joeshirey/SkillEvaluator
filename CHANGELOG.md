@@ -138,6 +138,19 @@ All notable changes to SkillEvaluator are documented in this file.
   observation only when its rendered inner call is known, keeps ambiguous
   observations explicit, and reports unsupported or malformed JavaScript as
   untrusted instead of a clean security result.
+- _(downstream, this fork only)_ Tier 3 Harbor GKE task images for the
+  with-skill and without-skill arms of the same scenario no longer share a
+  Docker image tag. `_write_task_toml()` now derives `[task].name` from both
+  the scenario id and the arm, so Harbor's image cache can no longer serve
+  one arm's baked-in content to the other, which previously made every
+  with/without-skill comparison a no-op whenever `force_build` was left at
+  its default of `false`. The image tag is still identical across an arm's
+  repeated k-attempts, so build caching within an arm is unaffected. The
+  collector's Harbor `task_name`-to-scenario-id reconciliation (used when a
+  reward has no `entry_id` of its own, notably for native multi-step
+  authoritative aggregate rewards) now also strips this new arm suffix so
+  scenarios continue to map back to their bare id instead of appearing as
+  unmatched, unscored cases in the report.
 
 ## 0.2.1 - 2026-08-24
 
