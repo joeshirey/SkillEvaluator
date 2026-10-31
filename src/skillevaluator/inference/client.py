@@ -46,6 +46,8 @@ from skillevaluator.provider_config import (
     OPENAI_BASE_URL,
     ProviderConfig,
     ProviderConfigurationError,
+    _is_vertex_openapi_endpoint,
+    _parse_vertex_openapi_metadata,
     _supports_custom_temperature,
     completion_token_limit,
     effective_reasoning_effort,
@@ -141,6 +143,15 @@ def _temperature_kwargs(model: str, temperature: float | None) -> dict[str, floa
     if temperature is None or not _supports_custom_temperature(model):
         return {}
     return {"temperature": temperature}
+
+
+def _is_vertex_rate_limit_or_timeout(exc: Exception) -> bool:
+    """Return whether ``exc`` is a 429 rate limit or a request timeout."""
+    from openai import APITimeoutError, RateLimitError
+
+    if isinstance(exc, (RateLimitError, APITimeoutError, TimeoutError)):
+        return True
+    return getattr(exc, "status_code", None) == 429
 
 
 class SchemaTargetKey(NamedTuple):
@@ -631,13 +642,87 @@ class LLMClient:
                             response = _create_chat_completion()
                         else:
                             raise
+                    elif _is_vertex_rate_limit_or_timeout(exc) and _is_vertex_openapi_endpoint(config.base_url):
+                        response = self._retry_with_fallback_projects(
+                            config,
+                            _openai_kwargs,
+                            response_schema=response_schema,
+                            original_exc=exc,
+                        )
                     else:
                         raise
+                elif _is_vertex_rate_limit_or_timeout(exc) and _is_vertex_openapi_endpoint(config.base_url):
+                    response = self._retry_with_fallback_projects(
+                        config,
+                        _openai_kwargs,
+                        response_schema=response_schema,
+                        original_exc=exc,
+                    )
                 else:
                     raise
             return _extract_choice_content(response)
 
         return retry_call_with_backoff(_invoke_provider, config=self._retry_config)
+
+    def _retry_with_fallback_projects(
+        self,
+        config: ProviderConfig,
+        build_kwargs: Callable[[bool], dict[str, Any]],
+        *,
+        response_schema: dict[str, Any] | None,
+        original_exc: Exception,
+    ) -> Any:
+        """Retry a rate-limited/timed-out Vertex OpenAPI call against fallback projects.
+
+        Each fallback attempt uses a freshly constructed, throwaway ``OpenAI``
+        client scoped to that single attempt so ``self._client`` and
+        ``self._provider_config`` are never mutated or leaked across calls.
+        """
+        fallback_projects = [
+            project.strip()
+            for project in os.environ.get("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "").split(",")
+            if project.strip()
+        ]
+        if not fallback_projects:
+            raise original_exc
+
+        primary_project, location = _parse_vertex_openapi_metadata(config.base_url)
+        if not primary_project or not location or not config.base_url:
+            raise original_exc
+
+        from openai import OpenAI
+
+        for fallback_project in fallback_projects:
+            if fallback_project == primary_project:
+                continue
+            fallback_base_url = config.base_url.replace(
+                f"/projects/{primary_project}/locations/{location}/endpoints/openapi",
+                f"/projects/{fallback_project}/locations/{location}/endpoints/openapi",
+            )
+            fallback_kwargs: dict[str, Any] = {
+                "api_key": config.api_key,
+                "base_url": fallback_base_url,
+                "max_retries": 0,
+            }
+            if self._http_client is not None:
+                fallback_kwargs["http_client"] = self._http_client
+            fallback_client = OpenAI(**fallback_kwargs)
+            fallback_target_key = SchemaTargetKey(config.provider, fallback_base_url, config.model)
+            fallback_use_schema = (
+                response_schema is not None and fallback_target_key not in _SCHEMA_UNSUPPORTED_TARGETS
+            )
+            try:
+                return _call_with_schema_fallback(
+                    fallback_client.chat.completions.create,
+                    build_kwargs,
+                    target_key=fallback_target_key,
+                    use_schema=fallback_use_schema,
+                )
+            except Exception:
+                continue
+            finally:
+                fallback_client.close()
+        raise original_exc
 
     def extract_json_from_response(
         self,

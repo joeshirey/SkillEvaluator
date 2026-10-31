@@ -1097,3 +1097,268 @@ class TestRefusalAndTruncation:
             assert client.process() == "fallback"
 
         assert client.last_failure is not None
+
+
+class TestVertexOpenAPIFallbackProjects:
+    def test_vertex_openapi_retries_next_project_on_rate_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Retry against a fallback GCP project when the primary project is rate-limited (429)."""
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1,fallback-proj-2")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client.chat.completions.create.side_effect = [_openai_choice_response("Fallback response")]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Fallback response"
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_count == 1
+        assert mock_ctor.call_count == 2
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert "primary-proj" not in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert mock_ctor.call_args_list[1].kwargs["max_retries"] == 0
+        assert primary_client.base_url == vertex_base_url
+        fallback_client.close.assert_called_once()
+
+    def test_vertex_openapi_falls_back_through_multiple_projects_on_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Keep trying fallback projects in order until one succeeds after a timeout."""
+        from openai import APITimeoutError, RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1,fallback-proj-2")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client_1 = MagicMock()
+        fallback_client_1.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+        fallback_client_2 = MagicMock()
+        fallback_client_2.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-2")
+
+        mock_timeout_err = APITimeoutError(MagicMock())
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [mock_timeout_err]
+        fallback_client_1.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client_2.chat.completions.create.side_effect = [_openai_choice_response("Second fallback response")]
+
+        with patch(
+            "openai.OpenAI", side_effect=[primary_client, fallback_client_1, fallback_client_2]
+        ) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Second fallback response"
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client_1.chat.completions.create.call_count == 1
+        assert fallback_client_2.chat.completions.create.call_count == 1
+        assert mock_ctor.call_count == 3
+        assert "fallback-proj-2" in mock_ctor.call_args_list[2].kwargs["base_url"]
+        assert primary_client.base_url == vertex_base_url
+        fallback_client_1.close.assert_called_once()
+        fallback_client_2.close.assert_called_once()
+
+    def test_vertex_openapi_fallback_does_not_leak_across_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fallback project used for one call must not persist to a later, unrelated call."""
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [
+            mock_rate_limit_err,
+            _openai_choice_response("Second call response"),
+        ]
+        fallback_client.chat.completions.create.side_effect = [_openai_choice_response("Fallback response")]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
+            client = LLMClient()
+            first_result = client.completions("system", "user one")
+            second_result = client.completions("system", "user two")
+
+        assert first_result == "Fallback response"
+        assert second_result == "Second call response"
+        assert primary_client.base_url == vertex_base_url
+        assert primary_client.chat.completions.create.call_count == 2
+        assert fallback_client.chat.completions.create.call_count == 1
+        assert mock_ctor.call_count == 2
+        assert mock_ctor.call_args_list[0].kwargs["base_url"] == vertex_base_url
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+
+    def test_vertex_openapi_without_fallback_env_var_reraises_original_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no fallback projects configured and max_retries=0, a 429 propagates directly."""
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.delenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", raising=False)
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        mock_openai = MagicMock()
+        mock_openai.base_url = vertex_base_url
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        mock_openai.chat.completions.create.side_effect = mock_rate_limit_err
+
+        with patch("openai.OpenAI", return_value=mock_openai):
+            client = LLMClient(max_retries=0)
+            with pytest.raises(RateLimitError):
+                client.completions("system", "user")
+
+        assert mock_openai.chat.completions.create.call_count == 1
+
+    def test_vertex_openapi_fallback_list_skips_self_referential_primary_project(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fallback list that includes the primary project itself skips that entry."""
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "primary-proj,fallback-proj-1")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client.chat.completions.create.side_effect = [_openai_choice_response("Fallback response")]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Fallback response"
+        assert mock_ctor.call_count == 2
+        assert "fallback-proj-1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert fallback_client.chat.completions.create.call_count == 1
+
+    def test_vertex_openapi_fallback_list_filters_empty_and_whitespace_entries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty-string and whitespace-only entries in the fallback list are filtered out."""
+        from openai import RateLimitError
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "proj1,, proj2 ")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        proj1_client = MagicMock()
+        proj1_client.base_url = vertex_base_url.replace("primary-proj", "proj1")
+        proj2_client = MagicMock()
+        proj2_client.base_url = vertex_base_url.replace("primary-proj", "proj2")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        mock_proj1_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        proj1_client.chat.completions.create.side_effect = [mock_proj1_err]
+        proj2_client.chat.completions.create.side_effect = [_openai_choice_response("Proj2 response")]
+
+        with patch(
+            "openai.OpenAI", side_effect=[primary_client, proj1_client, proj2_client]
+        ) as mock_ctor:
+            client = LLMClient()
+            result = client.completions("system", "user")
+
+        assert result == "Proj2 response"
+        assert mock_ctor.call_count == 3
+        assert "proj1" in mock_ctor.call_args_list[1].kwargs["base_url"]
+        assert "proj2" in mock_ctor.call_args_list[2].kwargs["base_url"]
+        for call in mock_ctor.call_args_list:
+            assert "/projects//" not in call.kwargs["base_url"]
+            assert "/projects/ " not in call.kwargs["base_url"]
+
+    def test_vertex_openapi_fallback_preserves_structured_schema_and_downgrade(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fallback project retries carry response_schema and support schema downgrade."""
+        from openai import RateLimitError
+
+        class SchemaRejected(Exception):
+            status_code = 400
+
+        vertex_base_url = (
+            "https://aiplatform.googleapis.com/v1/projects/primary-proj/locations/global/endpoints/openapi"
+        )
+        monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_EVAL_LLM_BASE_URL", vertex_base_url)
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", "google/gemini-3.8-flash")
+        monkeypatch.setenv("SKILL_EVAL_LLM_FALLBACK_PROJECTS", "fallback-proj-1")
+        monkeypatch.setattr("skillevaluator.provider_config._get_google_access_token", lambda **_kwargs: "mock-adc-token")
+        monkeypatch.setattr(client_mod, "_SCHEMA_UNSUPPORTED_TARGETS", set())
+
+        primary_client = MagicMock()
+        primary_client.base_url = vertex_base_url
+        fallback_client = MagicMock()
+        fallback_client.base_url = vertex_base_url.replace("primary-proj", "fallback-proj-1")
+
+        mock_rate_limit_err = RateLimitError("Too many requests", response=MagicMock(status_code=429), body=None)
+        primary_client.chat.completions.create.side_effect = [mock_rate_limit_err]
+        fallback_client.chat.completions.create.side_effect = [
+            SchemaRejected("response_format is unsupported"),
+            _openai_choice_response('{"ok": true}'),
+        ]
+
+        with patch("openai.OpenAI", side_effect=[primary_client, fallback_client]):
+            client = LLMClient()
+            result = client.completions("system", "user", response_schema={"type": "object"})
+
+        assert result == '{"ok": true}'
+        assert fallback_client.chat.completions.create.call_count == 2
+        first_kwargs = fallback_client.chat.completions.create.call_args_list[0].kwargs
+        second_kwargs = fallback_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" in first_kwargs
+        assert "response_format" not in second_kwargs
